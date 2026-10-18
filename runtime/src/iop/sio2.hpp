@@ -19,6 +19,8 @@ void set_axis(int pad, int axis, std::uint8_t value);
 void set_pressure(int pad, int button, std::uint8_t value);
 void set_connected(int pad, bool connected);
 std::uint16_t rumble(int pad);
+// what the host has put on a port, as the game reads it; used to record inputs
+void get_input(int pad, bool &connected, std::uint16_t &buttons, std::uint8_t axes[4], std::uint8_t pressure[16]);
 void flush_cards();
 
 }

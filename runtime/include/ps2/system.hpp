@@ -59,6 +59,13 @@ struct Options {
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
+    // every change of a controller port, one line per change, taken at the vblank once all input sources are applied
+    std::string input_record_path;
+    // a file written through input_record_path, applied at the same vblanks; frames are absolute, as for presses
+    std::string input_replay_path;
+    // a hash of the EE memory (RAM and scratchpad) and of the IOP RAM at every vblank, after the inputs are applied;
+    // two runs with the same inputs must write the same file
+    std::string hash_log_path;
 };
 
 extern Options g_options;
@@ -119,10 +126,17 @@ void start_vu_thread();
 void run_vu_thread();
 double vu_thread_idle_ms();
 std::uint64_t vu1_interpreted_calls();
+// VU1 programs compiled on the fly (the web JIT) and the milliseconds spent compiling them
+std::uint64_t vu1_jit_programs();
+double vu1_jit_ms();
+// time spent blocked on a full GS command ring: 0 is the ring to the render thread, 1 the one from the EE to the VU thread
+double gs_ring_wait_ms(int ring);
 void post_present();
 enum class Rendered { idle, presented, busy };
+// before_present runs ahead of each frame's presentation; returning false drops that presentation, while the frame
+// itself is still drawn into GS memory and counts as presented for the emulation
 Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy,
-                        const std::function<void()> &before_present, double budget_ms);
+                        const std::function<bool()> &before_present, double budget_ms);
 void wait_render_work(int timeout_ms);
 void wake_render_thread();
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);

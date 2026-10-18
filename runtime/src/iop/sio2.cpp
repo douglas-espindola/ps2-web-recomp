@@ -409,6 +409,14 @@ void set_connected(int pad, bool connected) {
 
 std::uint16_t rumble(int pad) { return pad >= 0 && pad < 2 ? g_feel[pad].rumble.load(std::memory_order_relaxed) : 0; }
 
+void get_input(int pad, bool &connected, std::uint16_t &buttons, std::uint8_t axes[4], std::uint8_t pressure[16]) {
+    if (pad < 0 || pad > 1) return;
+    connected = g_plugged[pad];
+    buttons = g_pads[pad].buttons;
+    std::copy(std::begin(g_pads[pad].axes), std::end(g_pads[pad].axes), axes);
+    std::copy(std::begin(g_feel[pad].pressure), std::end(g_feel[pad].pressure), pressure);
+}
+
 }
 
 namespace ps2::iop::sio2 {

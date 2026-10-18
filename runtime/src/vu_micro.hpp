@@ -19,5 +19,7 @@ void set_tops(std::uint32_t top, std::uint32_t itop);
 void code_changed(int unit);
 Vu0Regs &regs(int unit);
 std::uint64_t interpreted_calls();
+std::uint64_t jit_compiled();
+double jit_ms();
 
 }

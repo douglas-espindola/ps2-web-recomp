@@ -24,6 +24,8 @@ public:
     void pop(const Header &header);
     void wait_for_work(int timeout_ms);
     void wake();
+    // milliseconds a producer spent waiting for room in the ring
+    double blocked_ms() const { return blocked_ms_.load(std::memory_order_relaxed); }
 
 private:
     std::unique_ptr<std::uint8_t[]> buffer_;
@@ -33,6 +35,7 @@ private:
     alignas(64) std::atomic<std::uint32_t> posted_{0};
     alignas(64) std::atomic<std::uint32_t> freed_{0};
     std::atomic<std::uint32_t> consumer_waiting_{0}, producer_waiting_{0};
+    std::atomic<double> blocked_ms_{0.0};
 };
 
 Ring &render();

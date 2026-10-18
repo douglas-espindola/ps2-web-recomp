@@ -95,9 +95,9 @@ EM_JS(void, ps2web_frame_done, (), {
     requestAnimationFrame(() => Module.shownChannel.port2.postMessage(0));
     if (Module.onFrame) Module.onFrame();
 });
-EM_ASYNC_JS(void, ps2web_wait_shown, (), {
-    if (Module.shownPending) await new Promise((resolve) => Module.shownWaiters.push(resolve));
-});
+EM_JS(int, ps2web_shown_pending, (), { return Module.shownPending ? 1 : 0; });
+// a frame drawn but not shown: the page still polls input and counts it
+EM_JS(void, ps2web_frame_dropped, (), { if (Module.onFrame) Module.onFrame(true); });
 EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height, int wide), {
     const canvas = Module.canvas;
     if (!Module.blitContext) Module.blitContext = canvas.getContext('2d');
@@ -150,8 +150,49 @@ struct AudioRing {
     std::int16_t samples[kAudioFrames * 2];
 };
 
+// What the page last reported for each port. The page writes it whenever it polls; the emulation thread only
+// hands it to the SIO2 at the vblank, so an input never changes in the middle of a frame. state packs the
+// buttons in bits 0-15, the axes in bits 16-47 (right x highest, left y lowest) and the connected flag in bit 48.
+struct LivePad {
+    std::atomic<std::uint64_t> state;
+    std::atomic<std::uint32_t> pressure[4];
+};
+
+constexpr std::uint64_t kConnected = 1ull << 48;
+constexpr std::uint64_t kCentred = 0x80808080ull << 16;
+constexpr std::uint32_t kNoPressure = 0xFFFFFFFFu;
+
+// port 1 starts with a controller in it and port 2 empty, as the SIO2 does
+LivePad g_live[2] = {{{kCentred | kConnected}, {kNoPressure, kNoPressure, kNoPressure, kNoPressure}},
+                     {{kCentred}, {kNoPressure, kNoPressure, kNoPressure, kNoPressure}}};
+// what the emulation thread last handed over; only a change is applied, so scripted presses keep working
+std::uint64_t g_latched_state[2] = {kCentred | kConnected, kCentred};
+std::uint32_t g_latched_pressure[2][4] = {{kNoPressure, kNoPressure, kNoPressure, kNoPressure}, {kNoPressure, kNoPressure, kNoPressure, kNoPressure}};
+
+void latch_input() {
+    // a replay owns the controllers; live input would make it diverge
+    if (!ps2::g_options.input_replay_path.empty()) return;
+    for (int pad = 0; pad < 2; ++pad) {
+        const std::uint64_t state = g_live[pad].state.load(std::memory_order_acquire);
+        if (state != g_latched_state[pad]) {
+            if ((state ^ g_latched_state[pad]) & kConnected) ps2::set_pad_connected(pad, (state & kConnected) != 0);
+            g_latched_state[pad] = state;
+            ps2::set_pad_buttons(static_cast<std::uint16_t>(state), pad);
+            for (int axis = 0; axis < 4; ++axis) ps2::set_pad_axis(axis, static_cast<std::uint8_t>(state >> (40 - axis * 8)), pad);
+        }
+        for (int word = 0; word < 4; ++word) {
+            const std::uint32_t packed = g_live[pad].pressure[word].load(std::memory_order_relaxed);
+            if (packed == g_latched_pressure[pad][word]) continue;
+            g_latched_pressure[pad][word] = packed;
+            for (int i = 0; i < 4; ++i) ps2::set_pad_pressure(word * 4 + i, static_cast<std::uint8_t>(packed >> (i * 8)), pad);
+        }
+    }
+}
+
 AudioRing g_audio;
 Slot g_slots[kSlots];
+// milliseconds the emulation spent blocked on a disc block that had not arrived yet
+std::atomic<double> g_disc_wait{0.0};
 std::uint64_t g_disc_size = 0, g_use_clock = 0, g_last_chunk = ~0ull, g_run = 0;
 char *g_disc_url = nullptr;
 char *g_state_url = nullptr;
@@ -199,8 +240,11 @@ const Slot *chunk(std::uint64_t index) {
     advance(index);
     read_ahead(std::max(index, g_last_chunk));
     for (int attempt = 0; s && attempt < 4; ++attempt) {
+        const std::uint32_t first = s->state.load();
+        const double start = first != kReady && first != kFailed ? emscripten_get_now() : 0.0;
         for (std::uint32_t state = s->state.load(); state != kReady && state != kFailed; state = s->state.load())
             emscripten_futex_wait(&s->state, state, INFINITY);
+        if (start > 0.0) g_disc_wait.store(g_disc_wait.load() + emscripten_get_now() - start);
         if (s->state.load() == kReady) {
             s->used = ++g_use_clock;
             return s;
@@ -268,10 +312,24 @@ double audio_queued_ms() { return static_cast<double>(g_audio.write.load() - g_a
 double g_next_frame = 0.0;
 std::atomic<double> g_emulation_idle{0.0}, g_render_idle{0.0};
 
+// waits at the vblank that are not frame work: for the page to show earlier frames, and sleeps that
+// overran what was asked by more than 4 ms
+std::atomic<double> g_present_wait{0.0}, g_oversleep{0.0};
+std::atomic<std::uint64_t> g_audio_low{0}, g_dropped_frames{0};
+
+void sleep_ms(double ms) {
+    const double before = emscripten_get_now();
+    usleep(static_cast<useconds_t>(ms * 1000.0));
+    const double over = emscripten_get_now() - before - ms;
+    if (over > 4.0) g_oversleep.store(g_oversleep.load() + over);
+}
+
 void pace() {
+    const double start = emscripten_get_now();
     ps2::post_present();
+    g_present_wait.store(g_present_wait.load() + emscripten_get_now() - start);
     if (g_audio.active.load()) {
-        while (audio_queued_ms() > 80.0) usleep(1000);
+        while (audio_queued_ms() > 80.0) sleep_ms(1.0);
         g_next_frame = 0.0;
         return;
     }
@@ -279,13 +337,58 @@ void pace() {
     const double now = emscripten_get_now();
     if (g_next_frame == 0.0 || now - g_next_frame > 200.0) g_next_frame = now;
     g_next_frame += period;
-    if (g_next_frame > now) usleep(static_cast<useconds_t>((g_next_frame - now) * 1000.0));
+    if (g_next_frame > now) sleep_ms(g_next_frame - now);
+}
+
+// A frame whose emulation took more than one and a half frame periods. With Module.perf set, each one is
+// logged with what the emulation thread waited on meanwhile.
+bool g_perf = false;
+double g_frame_started = 0.0, g_mark_jit_ms = 0.0, g_mark_disc_ms = 0.0, g_mark_ring_ms[2] = {};
+std::uint64_t g_mark_jit_programs = 0;
+std::atomic<std::uint64_t> g_slow_frames{0};
+
+void check_frame(double now) {
+    const double period = ps2::g_options.pal ? 20.0 : 1000.0 / 59.94;
+    const std::uint64_t programs = ps2::vu1_jit_programs();
+    const double jit = ps2::vu1_jit_ms(), disc = g_disc_wait.load();
+    const double ring[2] = {ps2::gs_ring_wait_ms(0), ps2::gs_ring_wait_ms(1)};
+    const double work = g_frame_started > 0.0 ? now - g_frame_started : 0.0;
+    if (work > period * 1.5) {
+        g_slow_frames.fetch_add(1, std::memory_order_relaxed);
+        if (g_perf)
+            std::fprintf(stderr, "[perf] frame %llu: %.1f ms of emulation for a %.1f ms frame; VU1 JIT %llu programs %.1f ms, disc wait %.1f ms, "
+                                 "full GS ring %.1f ms, full VU ring %.1f ms, audio %.0f ms queued\n",
+                         static_cast<unsigned long long>(ps2::frames_run()), work, period, static_cast<unsigned long long>(programs - g_mark_jit_programs),
+                         jit - g_mark_jit_ms, disc - g_mark_disc_ms, ring[0] - g_mark_ring_ms[0], ring[1] - g_mark_ring_ms[1], audio_queued_ms());
+    }
+    g_mark_jit_programs = programs;
+    g_mark_jit_ms = jit;
+    g_mark_disc_ms = disc;
+    g_mark_ring_ms[0] = ring[0];
+    g_mark_ring_ms[1] = ring[1];
+}
+
+// The audio ring close to empty once the vblank wait is over: the next stall, of any kind, is heard.
+void check_audio(double present_before, double oversleep_before) {
+    if (!g_audio.active.load()) return;
+    const double queued = audio_queued_ms();
+    if (queued >= 20.0) return;
+    g_audio_low.fetch_add(1, std::memory_order_relaxed);
+    if (g_perf)
+        std::fprintf(stderr, "[perf] frame %llu: audio down to %.0f ms after the vblank wait; it waited %.1f ms for the page to show frames, sleeps overran by %.1f ms\n",
+                     static_cast<unsigned long long>(ps2::frames_run()), queued, g_present_wait.load() - present_before, g_oversleep.load() - oversleep_before);
 }
 
 void on_vblank() {
     const double start = emscripten_get_now();
+    check_frame(start);
+    const double present_before = g_present_wait.load(), oversleep_before = g_oversleep.load();
     pace();
-    g_emulation_idle.store(g_emulation_idle.load() + emscripten_get_now() - start);
+    check_audio(present_before, oversleep_before);
+    g_frame_started = emscripten_get_now();
+    g_emulation_idle.store(g_emulation_idle.load() + g_frame_started - start);
+    // after the wait, so the frame starts with the freshest input
+    latch_input();
 }
 
 struct Launch {
@@ -321,18 +424,23 @@ void *emulate(void *data) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pad(int pad, int buttons, int lx, int ly, int rx, int ry) {
-    ps2::set_pad_buttons(static_cast<std::uint16_t>(buttons), pad);
-    ps2::set_pad_axis(0, static_cast<std::uint8_t>(rx), pad);
-    ps2::set_pad_axis(1, static_cast<std::uint8_t>(ry), pad);
-    ps2::set_pad_axis(2, static_cast<std::uint8_t>(lx), pad);
-    ps2::set_pad_axis(3, static_cast<std::uint8_t>(ly), pad);
+    if (pad < 0 || pad > 1) return;
+    const std::uint64_t axes = static_cast<std::uint64_t>(rx & 0xFF) << 40 | static_cast<std::uint64_t>(ry & 0xFF) << 32 |
+                               static_cast<std::uint64_t>(lx & 0xFF) << 24 | static_cast<std::uint64_t>(ly & 0xFF) << 16;
+    std::uint64_t old = g_live[pad].state.load(std::memory_order_relaxed);
+    while (!g_live[pad].state.compare_exchange_weak(old, (old & kConnected) | axes | static_cast<std::uint16_t>(buttons), std::memory_order_release)) {}
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pad_connected(int pad, int connected) { ps2::set_pad_connected(pad, connected != 0); }
+extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pad_connected(int pad, int connected) {
+    if (pad < 0 || pad > 1) return;
+    if (connected) g_live[pad].state.fetch_or(kConnected, std::memory_order_release);
+    else g_live[pad].state.fetch_and(~kConnected, std::memory_order_release);
+}
 
 extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pressure(int pad, int a, int b, int c, int d) {
+    if (pad < 0 || pad > 1) return;
     const int packed[4] = {a, b, c, d};
-    for (int i = 0; i < 16; ++i) ps2::set_pad_pressure(i, static_cast<std::uint8_t>(static_cast<unsigned>(packed[i / 4]) >> (i % 4 * 8)), pad);
+    for (int i = 0; i < 4; ++i) g_live[pad].pressure[i].store(static_cast<std::uint32_t>(packed[i]), std::memory_order_relaxed);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int ps2web_rumble(int pad) { return ps2::pad_rumble(pad); }
@@ -347,6 +455,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_primitives() { return static_cast<
 extern "C" EMSCRIPTEN_KEEPALIVE void *ps2web_audio_ring() { return &g_audio; }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_queued_ms() { return audio_queued_ms(); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_vu_interpreted() { return static_cast<double>(ps2::vu1_interpreted_calls()); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_vu_jit_programs() { return static_cast<double>(ps2::vu1_jit_programs()); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_vu_jit_ms() { return ps2::vu1_jit_ms(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_disc_wait_ms() { return g_disc_wait.load(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_slow_frames() { return static_cast<double>(g_slow_frames.load(std::memory_order_relaxed)); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_present_wait_ms() { return g_present_wait.load(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_oversleep_ms() { return g_oversleep.load(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_low_frames() { return static_cast<double>(g_audio_low.load(std::memory_order_relaxed)); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_dropped_frames() { return static_cast<double>(g_dropped_frames.load(std::memory_order_relaxed)); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_ring_wait_ms(int ring) { return ps2::gs_ring_wait_ms(ring); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int which) {
     if (which == 2) return ps2::vu_thread_idle_ms();
     return which ? g_render_idle.load() : g_emulation_idle.load();
@@ -363,6 +480,9 @@ int main(int argc, char **argv) {
             ps2::Press press;
             if (ps2::parse_press(argv[++i], press)) ps2::g_options.presses.push_back(press);
         }
+        else if (a == "--record-input" && i + 1 < argc) ps2::g_options.input_record_path = argv[++i];
+        else if (a == "--replay-input" && i + 1 < argc) ps2::g_options.input_replay_path = argv[++i];
+        else if (a == "--hash-log" && i + 1 < argc) ps2::g_options.hash_log_path = argv[++i];
     }
     if (launch.args.empty()) {
         std::string boot = "/game/core.elf";
@@ -379,6 +499,7 @@ int main(int argc, char **argv) {
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();
     g_state_url = ps2web_state_url();
+    g_perf = EM_ASM_INT({ return Module.perf ? 1 : 0; }) != 0;
     ps2::g_options.on_vblank = on_vblank;
     ps2::g_options.on_vu_program = [](const std::string &name, const std::uint8_t *code, std::size_t size) {
         static bool unsupported = false;
@@ -434,27 +555,21 @@ int main(int argc, char **argv) {
         ps2web_blit(rgba, static_cast<int>(width), static_cast<int>(height), ps2::g_options.widescreen ? 1 : 0);
     };
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none;
-    const std::function<void()> wait_shown = [] {
-        static int since_skip = 0;
-        static double window_start = 0.0, window_gpu = 0.0, gpu_load = 1.0;
-        const double start = emscripten_get_now();
-        if (start - window_start > 500.0) {
-            const double gpu = ps2::gpu_busy_ms();
-            gpu_load = window_start > 0.0 ? (gpu - window_gpu) / (start - window_start) : 1.0;
-            window_start = start;
-            window_gpu = gpu;
-        }
-        if (++since_skip > 8 && gpu_load < 0.8 && g_audio.active.load() && audio_queued_ms() < 40.0) {
-            since_skip = 0;
-            return;
-        }
-        ps2web_wait_shown();
-        g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);
+    // While the page has not shown the previous frame, a new one is drawn but not presented. Waiting instead
+    // would hold the emulation to the display: a slow or covered window would slow the game and starve the audio.
+    static bool dropped = false;
+    const std::function<bool()> show_unless_pending = [] {
+        dropped = ps2web_shown_pending() != 0;
+        if (dropped) g_dropped_frames.fetch_add(1, std::memory_order_relaxed);
+        return !dropped;
     };
     for (;;) {
         service_disc();
-        const ps2::Rendered rendered = ps2::render_pending(surface, copy ? blit : none, wait_shown, 6.0);
-        if (rendered == ps2::Rendered::presented) ps2web_frame_done();
+        const ps2::Rendered rendered = ps2::render_pending(surface, copy ? blit : none, show_unless_pending, 6.0);
+        if (rendered == ps2::Rendered::presented) {
+            if (dropped) ps2web_frame_dropped();
+            else ps2web_frame_done();
+        }
         if (rendered != ps2::Rendered::idle) {
             ps2::browser_yield();
         } else {

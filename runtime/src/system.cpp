@@ -122,6 +122,136 @@ void apply_presses() {
     }
 }
 
+// One port's state at a vblank. The text form is "frame pad connected buttons axes pressure", in hex past the
+// first two fields, with the axes in SIO2 order (right x, right y, left x, left y).
+struct InputLine {
+    std::uint64_t frame = 0;
+    int pad = 0;
+    bool connected = false;
+    std::uint16_t buttons = 0;
+    std::uint8_t axes[4] = {0x80, 0x80, 0x80, 0x80};
+    std::uint8_t pressure[16] = {};
+};
+
+std::FILE *g_input_record = nullptr;
+InputLine g_input_recorded[2];
+bool g_input_record_started = false;
+std::vector<InputLine> g_input_replay;
+std::size_t g_input_replay_next = 0;
+bool g_input_replay_loaded = false;
+
+bool same_input(const InputLine &a, const InputLine &b) {
+    return a.connected == b.connected && a.buttons == b.buttons && std::equal(std::begin(a.axes), std::end(a.axes), b.axes) &&
+           std::equal(std::begin(a.pressure), std::end(a.pressure), b.pressure);
+}
+
+bool parse_input(const std::string &text, InputLine &l) {
+    unsigned long long frame = 0;
+    int pad = 0, connected = 0;
+    unsigned buttons = 0, axes = 0;
+    char pressure[33] = {};
+    if (std::sscanf(text.c_str(), "%llu %d %d %x %x %32s", &frame, &pad, &connected, &buttons, &axes, pressure) != 6) return false;
+    if (pad < 0 || pad > 1 || std::strlen(pressure) != 32) return false;
+    l.frame = frame;
+    l.pad = pad;
+    l.connected = connected != 0;
+    l.buttons = static_cast<std::uint16_t>(buttons);
+    for (int i = 0; i < 4; ++i) l.axes[i] = static_cast<std::uint8_t>(axes >> (24 - i * 8));
+    for (int i = 0; i < 16; ++i) {
+        const char hex[3] = {pressure[i * 2], pressure[i * 2 + 1], 0};
+        l.pressure[i] = static_cast<std::uint8_t>(std::strtoul(hex, nullptr, 16));
+    }
+    return true;
+}
+
+void apply_input(const InputLine &l) {
+    iop::sio2::set_connected(l.pad, l.connected);
+    iop::sio2::set_buttons(l.pad, l.buttons);
+    for (int i = 0; i < 4; ++i) iop::sio2::set_axis(l.pad, i, l.axes[i]);
+    for (int i = 0; i < 16; ++i) iop::sio2::set_pressure(l.pad, i, l.pressure[i]);
+}
+
+void replay_inputs() {
+    if (g_options.input_replay_path.empty()) return;
+    if (!g_input_replay_loaded) {
+        g_input_replay_loaded = true;
+        std::ifstream in(g_options.input_replay_path);
+        if (!in) std::fprintf(stderr, "[input] cannot read %s\n", g_options.input_replay_path.c_str());
+        std::string text;
+        InputLine l;
+        while (std::getline(in, text))
+            if (!text.empty() && text[0] != '#' && parse_input(text, l)) g_input_replay.push_back(l);
+        std::stable_sort(g_input_replay.begin(), g_input_replay.end(), [](const InputLine &a, const InputLine &b) { return a.frame < b.frame; });
+        std::fprintf(stderr, "[input] replaying %zu changes from %s\n", g_input_replay.size(), g_options.input_replay_path.c_str());
+    }
+    // a replay started from a later state catches up by applying every earlier change in order
+    while (g_input_replay_next < g_input_replay.size() && g_input_replay[g_input_replay_next].frame <= g_frames) apply_input(g_input_replay[g_input_replay_next++]);
+}
+
+void record_inputs() {
+    if (g_options.input_record_path.empty()) return;
+    if (!g_input_record) {
+        g_input_record = std::fopen(g_options.input_record_path.c_str(), "w");
+        if (!g_input_record) {
+            std::fprintf(stderr, "[input] cannot write %s\n", g_options.input_record_path.c_str());
+            g_options.input_record_path.clear();
+            return;
+        }
+        std::fprintf(g_input_record, "# ps2 input record v1: frame pad connected buttons axes(rx ry lx ly) pressure[16]\n");
+    }
+    for (int pad = 0; pad < 2; ++pad) {
+        InputLine l;
+        l.frame = g_frames;
+        l.pad = pad;
+        iop::sio2::get_input(pad, l.connected, l.buttons, l.axes, l.pressure);
+        if (g_input_record_started && same_input(l, g_input_recorded[pad])) continue;
+        g_input_recorded[pad] = l;
+        char pressure[33];
+        for (int i = 0; i < 16; ++i) std::snprintf(pressure + i * 2, 3, "%02x", l.pressure[i]);
+        std::fprintf(g_input_record, "%llu %d %d %04x %02x%02x%02x%02x %s\n", static_cast<unsigned long long>(l.frame), pad, l.connected ? 1 : 0, l.buttons,
+                     l.axes[0], l.axes[1], l.axes[2], l.axes[3], pressure);
+    }
+    g_input_record_started = true;
+    // flushed about once a second: on the web each write is a call to the page thread
+    if (g_frames % 50 == 0) std::fflush(g_input_record);
+}
+
+// Four lanes of multiply and rotate over 8-byte words, folded together at the end; fast enough to run every frame
+// over the 32 MB of EE RAM. The sizes hashed here are all multiples of 32 bytes.
+std::uint64_t hash_memory(const std::uint8_t *data, std::size_t size) {
+    constexpr std::uint64_t kPrime1 = 0x9E3779B185EBCA87ull, kPrime2 = 0xC2B2AE3D27D4EB4Full;
+    std::uint64_t lane[4] = {kPrime1, kPrime2, ~kPrime1, ~kPrime2};
+    for (std::size_t at = 0; at + 32 <= size; at += 32)
+        for (int i = 0; i < 4; ++i) {
+            std::uint64_t word;
+            std::memcpy(&word, data + at + i * 8, sizeof word);
+            const std::uint64_t mixed = lane[i] + word * kPrime2;
+            lane[i] = ((mixed << 31) | (mixed >> 33)) * kPrime1;
+        }
+    std::uint64_t h = size;
+    for (const std::uint64_t l : lane) h = (h ^ l) * kPrime1 + kPrime2;
+    return h ^ (h >> 29);
+}
+
+std::FILE *g_hash_log = nullptr;
+
+void log_hashes() {
+    if (g_options.hash_log_path.empty()) return;
+    if (!g_hash_log) {
+        g_hash_log = std::fopen(g_options.hash_log_path.c_str(), "w");
+        if (!g_hash_log) {
+            std::fprintf(stderr, "[hash] cannot write %s\n", g_options.hash_log_path.c_str());
+            g_options.hash_log_path.clear();
+            return;
+        }
+        std::fprintf(g_hash_log, "# ps2 state hash v1: frame ee(ram+scratchpad) iop(ram)\n");
+    }
+    const std::uint64_t ee = hash_memory(g_ram, kRamSize) ^ (hash_memory(g_spr, kScratchpadSize) * 0x100000001B3ull);
+    std::fprintf(g_hash_log, "%llu %016llx %016llx\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(ee),
+                 static_cast<unsigned long long>(hash_memory(iop::g_ram, iop::kRamSize)));
+    if (g_frames % 50 == 0) std::fflush(g_hash_log);
+}
+
 void time_frames() {
     static const char *spec = std::getenv("PS2_TIME");
     if (!spec) return;
@@ -156,6 +286,9 @@ void vblank() {
     apply_presses();
     apply_patches(false);
     if (g_options.on_vblank) g_options.on_vblank();
+    replay_inputs();
+    record_inputs();
+    log_hashes();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
@@ -234,6 +367,8 @@ bool preempt(Cpu &c) {
 
 void halt(const std::string &reason) {
     if (!g_halted) std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
+    if (g_input_record) std::fflush(g_input_record);
+    if (g_hash_log) std::fflush(g_hash_log);
     g_halted = true;
     g_halt_reason = reason;
 }
@@ -464,6 +599,9 @@ std::atomic<double> g_vu_idle_ms{0.0};
 
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
 std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
+std::uint64_t vu1_jit_programs() { return vu::jit_compiled(); }
+double vu1_jit_ms() { return vu::jit_ms(); }
+double gs_ring_wait_ms(int ring) { return ring ? gs::queue::vu().blocked_ms() : gs::queue::render().blocked_ms(); }
 
 void run_vu_thread() {
     gs::queue::role() = gs::queue::Role::Vu;
@@ -495,10 +633,10 @@ void run_vu_thread() {
 void post_present() { gs::post_present(); }
 
 Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy,
-                        const std::function<void()> &before_present, double budget_ms) {
+                        const std::function<bool()> &before_present, double budget_ms) {
     static std::vector<std::uint32_t> frame;
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
-        if (before_present) before_present();
+        if (before_present && !before_present()) return;
         if (surface) {
             gs::present(regs);
             return;

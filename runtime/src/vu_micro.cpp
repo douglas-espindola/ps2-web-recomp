@@ -12,6 +12,7 @@
 #include "ps2/state.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -753,10 +754,18 @@ std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
 std::vector<std::uint32_t> *g_kick_log = nullptr;
 std::int64_t *g_capture = nullptr;
 
+// programs translated on the fly and the time it took; the VU stalls while one compiles
+std::atomic<std::uint64_t> g_jit_compiled{0};
+std::atomic<double> g_jit_ms{0.0};
+
 ProgramFn jit_program(std::uint64_t key, std::uint32_t address) {
     const auto it = g_jit_programs.find(key);
     if (it != g_jit_programs.end()) return it->second;
+    const auto start = std::chrono::steady_clock::now();
     const ProgramFn fn = jit::compile(g_vu1_code, address & 16383u);
+    g_jit_ms.store(g_jit_ms.load(std::memory_order_relaxed) + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                   std::memory_order_relaxed);
+    g_jit_compiled.fetch_add(1, std::memory_order_relaxed);
     g_jit_programs[key] = fn;
     return fn;
 }
@@ -786,6 +795,8 @@ ProgramFn lookup(std::uint32_t address);
 std::atomic<std::uint64_t> g_interpreted_calls{0};
 
 std::uint64_t interpreted_calls() { return g_interpreted_calls.load(std::memory_order_relaxed); }
+std::uint64_t jit_compiled() { return g_jit_compiled.load(std::memory_order_relaxed); }
+double jit_ms() { return g_jit_ms.load(std::memory_order_relaxed); }
 
 void check_jit(ProgramFn compiled, ProgramFn jit) {
     static std::uint64_t calls = 0, escapes = 0, mismatches = 0;
