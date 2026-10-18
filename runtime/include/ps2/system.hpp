@@ -93,6 +93,8 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+// one hash of the EE RAM, the scratchpad and the IOP RAM; two runs in the same state give the same value
+std::uint64_t state_hash();
 // the time the console's clock shows, from Options::rtc_epoch or from the host
 std::time_t guest_clock();
 std::uint64_t hblank_cycles();
@@ -157,6 +159,10 @@ bool parse_press(const std::string &spec, Press &press);
 bool parse_axis(const std::string &spec, AxisPress &press);
 bool load_patches(const std::string &path);
 double gpu_busy_ms();
+// synchronous reads of GS memory back from the GPU so far, and the milliseconds spent waiting for them
+double gpu_readback_ms(std::uint64_t &count);
+// GPU batches ended so far for one reason (see gs/gpu/gpu.hpp, batch_ends)
+std::uint64_t gpu_batch_ends(int reason);
 void browser_yield();
 std::uint64_t frames_run();
 std::uint64_t primitives_drawn();

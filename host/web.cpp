@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -169,23 +170,68 @@ LivePad g_live[2] = {{{kCentred | kConnected}, {kNoPressure, kNoPressure, kNoPre
 std::uint64_t g_latched_state[2] = {kCentred | kConnected, kCentred};
 std::uint32_t g_latched_pressure[2][4] = {{kNoPressure, kNoPressure, kNoPressure, kNoPressure}, {kNoPressure, kNoPressure, kNoPressure, kNoPressure}};
 
+void apply_pad(int pad, std::uint64_t state) {
+    if (state == g_latched_state[pad]) return;
+    if ((state ^ g_latched_state[pad]) & kConnected) ps2::set_pad_connected(pad, (state & kConnected) != 0);
+    g_latched_state[pad] = state;
+    ps2::set_pad_buttons(static_cast<std::uint16_t>(state), pad);
+    for (int axis = 0; axis < 4; ++axis) ps2::set_pad_axis(axis, static_cast<std::uint8_t>(state >> (40 - axis * 8)), pad);
+}
+
 void latch_input() {
     // a replay owns the controllers; live input would make it diverge
     if (!ps2::g_options.input_replay_path.empty()) return;
     for (int pad = 0; pad < 2; ++pad) {
-        const std::uint64_t state = g_live[pad].state.load(std::memory_order_acquire);
-        if (state != g_latched_state[pad]) {
-            if ((state ^ g_latched_state[pad]) & kConnected) ps2::set_pad_connected(pad, (state & kConnected) != 0);
-            g_latched_state[pad] = state;
-            ps2::set_pad_buttons(static_cast<std::uint16_t>(state), pad);
-            for (int axis = 0; axis < 4; ++axis) ps2::set_pad_axis(axis, static_cast<std::uint8_t>(state >> (40 - axis * 8)), pad);
-        }
+        apply_pad(pad, g_live[pad].state.load(std::memory_order_acquire));
         for (int word = 0; word < 4; ++word) {
             const std::uint32_t packed = g_live[pad].pressure[word].load(std::memory_order_relaxed);
             if (packed == g_latched_pressure[pad][word]) continue;
             g_latched_pressure[pad][word] = packed;
             for (int i = 0; i < 4; ++i) ps2::set_pad_pressure(word * 4 + i, static_cast<std::uint8_t>(packed >> (i * 8)), pad);
         }
+    }
+}
+
+// Lockstep netplay (--lockstep): the page hands over the state of both ports for every frame, packed as LivePad's
+// state, and the emulation thread waits at the vblank until the frame it is about to run has them. Peers that
+// start from the same state and apply the same inputs at the same frames stay identical. Pressure is left as the
+// state has it, since the page does not exchange it. Every kNetHashEvery frames the state hash is kept for the
+// page to compare with the other peer's.
+constexpr std::uint32_t kNetFrames = 256, kNetHashes = 64, kNetHashEvery = 60;
+struct NetFrame {
+    std::atomic<std::uint32_t> frame{~0u};
+    std::uint64_t pads[2] = {};
+};
+struct NetHash {
+    std::uint32_t frame = 0;
+    std::uint64_t hash = 0;
+};
+bool g_lockstep = false;
+NetFrame g_net[kNetFrames];
+std::atomic<std::uint32_t> g_net_posted{0}, g_net_waiting{0}, g_net_hash_count{0};
+NetHash g_net_hashes[kNetHashes];
+std::atomic<double> g_net_wait{0.0};
+
+void lockstep_input() {
+    const std::uint32_t frame = static_cast<std::uint32_t>(ps2::frames_run());
+    NetFrame &n = g_net[frame % kNetFrames];
+    if (n.frame.load(std::memory_order_acquire) != frame) {
+        const double start = emscripten_get_now();
+        g_net_waiting.store(frame);
+        for (;;) {
+            const std::uint32_t seen = g_net_posted.load();
+            if (n.frame.load(std::memory_order_acquire) == frame) break;
+            emscripten_futex_wait(&g_net_posted, seen, 100);
+        }
+        g_net_waiting.store(0);
+        g_net_wait.store(g_net_wait.load() + emscripten_get_now() - start);
+    }
+    apply_pad(0, n.pads[0]);
+    apply_pad(1, n.pads[1]);
+    if (frame % kNetHashEvery == 0) {
+        const std::uint32_t at = g_net_hash_count.load();
+        g_net_hashes[at % kNetHashes] = {frame, ps2::state_hash()};
+        g_net_hash_count.store(at + 1, std::memory_order_release);
     }
 }
 
@@ -311,6 +357,9 @@ double audio_queued_ms() { return static_cast<double>(g_audio.write.load() - g_a
 
 double g_next_frame = 0.0;
 std::atomic<double> g_emulation_idle{0.0}, g_render_idle{0.0};
+// the page thread's loop: the longest pass through the GS work (plus presenting and the page's frame callback), and
+// the longest the browser kept the thread before handing it back after a yield; both reset when the page reads them
+std::atomic<double> g_page_render_max{0.0}, g_page_yield_max{0.0};
 
 // waits at the vblank that are not frame work: for the page to show earlier frames, and sleeps that
 // overran what was asked by more than 4 ms
@@ -385,10 +434,11 @@ void on_vblank() {
     const double present_before = g_present_wait.load(), oversleep_before = g_oversleep.load();
     pace();
     check_audio(present_before, oversleep_before);
+    // after the wait, so the frame starts with the freshest input; in lockstep, the wait for the peer counts as idle
+    if (g_lockstep) lockstep_input();
+    else latch_input();
     g_frame_started = emscripten_get_now();
     g_emulation_idle.store(g_emulation_idle.load() + g_frame_started - start);
-    // after the wait, so the frame starts with the freshest input
-    latch_input();
 }
 
 struct Launch {
@@ -462,6 +512,39 @@ extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_slow_frames() { return static_cast
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_present_wait_ms() { return g_present_wait.load(); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_oversleep_ms() { return g_oversleep.load(); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_low_frames() { return static_cast<double>(g_audio_low.load(std::memory_order_relaxed)); }
+extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_netplay_frame(int frame, int pad0_low, int pad0_high, int pad1_low, int pad1_high) {
+    NetFrame &n = g_net[static_cast<std::uint32_t>(frame) % kNetFrames];
+    n.pads[0] = static_cast<std::uint32_t>(pad0_low) | static_cast<std::uint64_t>(static_cast<std::uint32_t>(pad0_high)) << 32;
+    n.pads[1] = static_cast<std::uint32_t>(pad1_low) | static_cast<std::uint64_t>(static_cast<std::uint32_t>(pad1_high)) << 32;
+    n.frame.store(static_cast<std::uint32_t>(frame), std::memory_order_release);
+    g_net_posted.fetch_add(1);
+    emscripten_futex_wake(&g_net_posted, INT_MAX);
+}
+// the frame the emulation is waiting inputs for, or 0 while it runs
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_waiting() { return static_cast<double>(g_net_waiting.load()); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_wait_ms() { return g_net_wait.load(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_hash_count() { return static_cast<double>(g_net_hash_count.load(std::memory_order_acquire)); }
+// hash i (counting from 0) as frame, low and high words; only the last kNetHashes are kept
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_hash_frame(int i) { return g_net_hashes[static_cast<std::uint32_t>(i) % kNetHashes].frame; }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_hash_low(int i) { return static_cast<double>(g_net_hashes[static_cast<std::uint32_t>(i) % kNetHashes].hash & 0xFFFFFFFFu); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_netplay_hash_high(int i) { return static_cast<double>(g_net_hashes[static_cast<std::uint32_t>(i) % kNetHashes].hash >> 32); }
+
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_gpu_readbacks() {
+    std::uint64_t count = 0;
+    ps2::gpu_readback_ms(count);
+    return static_cast<double>(count);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_gpu_readback_ms() {
+    std::uint64_t count = 0;
+    return ps2::gpu_readback_ms(count);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_batch_ends(int reason) { return static_cast<double>(ps2::gpu_batch_ends(reason)); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_page_max(int which) {
+    std::atomic<double> &value = which ? g_page_yield_max : g_page_render_max;
+    const double v = value.load();
+    value.store(0.0);
+    return v;
+}
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_dropped_frames() { return static_cast<double>(g_dropped_frames.load(std::memory_order_relaxed)); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_ring_wait_ms(int ring) { return ps2::gs_ring_wait_ms(ring); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int which) {
@@ -484,6 +567,7 @@ int main(int argc, char **argv) {
         else if (a == "--replay-input" && i + 1 < argc) ps2::g_options.input_replay_path = argv[++i];
         else if (a == "--hash-log" && i + 1 < argc) ps2::g_options.hash_log_path = argv[++i];
         else if (a == "--rtc" && i + 1 < argc) ps2::g_options.rtc_epoch = std::strtoll(argv[++i], nullptr, 10);
+        else if (a == "--lockstep") g_lockstep = true;
         else if (a == "--hash-blocks" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const auto dash = spec.find('-');
@@ -579,14 +663,19 @@ int main(int argc, char **argv) {
         return !dropped;
     };
     for (;;) {
+        const double pass = emscripten_get_now();
         service_disc();
         const ps2::Rendered rendered = ps2::render_pending(surface, copy ? blit : none, show_unless_pending, 6.0);
         if (rendered == ps2::Rendered::presented) {
             if (dropped) ps2web_frame_dropped();
             else ps2web_frame_done();
         }
+        const double passed = emscripten_get_now();
+        if (passed - pass > g_page_render_max.load()) g_page_render_max.store(passed - pass);
         if (rendered != ps2::Rendered::idle) {
             ps2::browser_yield();
+            const double back = emscripten_get_now() - passed;
+            if (back > g_page_yield_max.load()) g_page_yield_max.store(back);
         } else {
             const double start = emscripten_get_now();
             ps2::wait_render_work(50);

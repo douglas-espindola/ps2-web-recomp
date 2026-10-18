@@ -45,6 +45,12 @@ void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();
 bool present(const DisplaySource &src);
 double busy_ms();
+// synchronous reads of GS memory back from the GPU, and the milliseconds the page thread waited for them
+std::uint64_t readbacks();
+// batches ended so far for one reason: 0 render target change, 1 unknown texel area, 2 texture read from the frame being
+// drawn, 3 from the z buffer being written, 4 batch full, 5 upload or CLUT load over its pages, 6 flush, 7 CLUT slots full
+std::uint64_t batch_ends(int reason);
+double readback_ms();
 void stats();
 
 }

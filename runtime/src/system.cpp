@@ -746,6 +746,13 @@ bool parse_axis(const std::string &spec, AxisPress &press) {
 }
 
 double gpu_busy_ms() { return gs::gpu_busy_ms(); }
+double gpu_readback_ms(std::uint64_t &count) { return gs::gpu_readback_ms(count); }
+std::uint64_t gpu_batch_ends(int reason) { return gs::gpu_batch_ends(reason); }
+
+std::uint64_t state_hash() {
+    const std::uint64_t ee = hash_memory(g_ram, kRamSize) ^ (hash_memory(g_spr, kScratchpadSize) * 0x100000001B3ull);
+    return ee ^ (hash_memory(iop::g_ram, iop::kRamSize) * 0x9E3779B97F4A7C15ull);
+}
 
 std::time_t guest_clock() {
     if (g_options.rtc_epoch < 0) return std::time(nullptr);

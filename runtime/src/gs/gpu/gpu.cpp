@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -648,8 +649,35 @@ void emit_all() {
     flush_batch();
 }
 
+// Why batches end, counted for performance work: every batch is a dispatch the GPU finishes before the next
+enum BatchEnd { kEndTarget, kEndTexels, kEndFrameFeedback, kEndZFeedback, kEndFull, kEndConflict, kEndFlush, kEndClutSlots, kEndReasons };
+std::uint64_t g_batch_ends[kEndReasons] = {};
+
+void end_batch(BatchEnd reason) {
+    if (!g_batch.prims.empty()) ++g_batch_ends[reason];
+    emit_all();
+}
+
+int trace_batches() {
+    static int left = [] { const char *n = std::getenv("PS2_TRACE_BATCH"); return n ? std::atoi(n) : 0; }();
+    return left > 0 ? left-- : 0;
+}
+
 void queue_pre(const PreOp &op) {
-    if (batch_conflict(op.range, op.clut)) emit_all();
+    if (batch_conflict(op.range, op.clut)) {
+        if (trace_batches()) {
+            const Batch &b = g_batch;
+            bool read = false;
+            for (const Range &t : g_batch_reads) read = read || t.overlaps(op.range.lo, op.range.hi);
+            std::fprintf(stderr, "[batch] upload: %s psm %02x bytes %llx-%llx rect %u,%u-%u,%u | hits%s%s%s | frame fbp %u fpsm %02x bytes %llx-%llx | z zbp %u zpsm %02x zte %d bytes %llx-%llx | %zu prims\n",
+                         op.clut ? "clut" : "image", op.clut ? op.rec[3] : op.rec[2], static_cast<unsigned long long>(op.range.lo), static_cast<unsigned long long>(op.range.hi),
+                         op.x0, op.y0, op.x1, op.y1, b.fb_range.overlaps(op.range.lo, op.range.hi) ? " frame" : "",
+                         b.zte && b.z_range.overlaps(op.range.lo, op.range.hi) ? " z" : "", !op.clut && read ? " read" : "", b.fbp, b.fpsm,
+                         static_cast<unsigned long long>(b.fb_range.lo), static_cast<unsigned long long>(b.fb_range.hi), b.zbp, b.zpsm, b.zte ? 1 : 0,
+                         static_cast<unsigned long long>(b.z_range.lo), static_cast<unsigned long long>(b.z_range.hi), b.prims.size() / kPrimWords);
+        }
+        end_batch(kEndConflict);
+    }
     g_pre.push_back(op);
 }
 
@@ -711,7 +739,7 @@ void flush_image() {
 
 void flush_all() {
     flush_image();
-    emit_all();
+    end_batch(kEndFlush);
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -834,6 +862,7 @@ void profile_submit() {
         }
         wgpuBufferUnmap(g_profile_read);
     }
+    if (g_profile_out) std::fflush(g_profile_out);
     g_commands.clear();
     g_command_info.clear();
     ++g_serial;
@@ -846,9 +875,11 @@ void profile_submit() {
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view) return;
-    if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+    if (g_profile_out && g_timestamps && !g_commands.empty() && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+        // the frame's work is measured on its own; a presentation then goes out with no commands of its own, so frames
+        // whose whole work rides with the present are profiled too
         profile_submit();
-        return;
+        if (!present_view) return;
     }
     ensure_capacity();
     wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
@@ -942,7 +973,12 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_clut_loads = 0;
 }
 
+// GS memory read back to the CPU: each waits for all the work queued on the GPU before it
+std::uint64_t g_readbacks = 0;
+double g_readback_ms = 0.0;
+
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
+    const auto start = std::chrono::steady_clock::now();
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     wgpuCommandEncoderCopyBufferToBuffer(enc, source, offset, g_readback, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -962,6 +998,8 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
     const void *mapped = wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
     if (mapped) std::memcpy(out, mapped, bytes);
     wgpuBufferUnmap(g_readback);
+    ++g_readbacks;
+    g_readback_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) {
@@ -1363,7 +1401,7 @@ void draw(const State &st, const Vertex *v, int count) {
     Batch &b = g_batch;
     const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
-    if (b.key != ~0ull && b.key != key) emit_all();
+    if (b.key != ~0ull && b.key != key) end_batch(kEndTarget);
     const Range &tex = cache.tex;
     if (flags & 2u) {
         if (!b.prims.empty()) {
@@ -1372,13 +1410,31 @@ void draw(const State &st, const Vertex *v, int count) {
             int rect[4];
             if (written(tex)) {
                 if (!texel_rect(setup, v, count, prim, fst, rect)) {
-                    emit_all();
+                    end_batch(kEndTexels);
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
                     const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
                     const bool frame = !cached && (shares_frame(setup, b) ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
-                    if (frame || (b.zwrite && used.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
+                    // A 24-bit z buffer leaves the top byte of each word alone (the store masks it), and PSMT8H, PSMT4HL and
+                    // PSMT4HH read only that byte. Games keep textures there, so drawing with z writes cannot change what such
+                    // a texture samples; ending the batch for it cut Naruto's fights into one batch per primitive.
+                    const bool high_byte = setup[14] == PSMT8H || setup[14] == PSMT4HL || setup[14] == PSMT4HH;
+                    // PS2_GPU_Z_SPARES=0 goes back to ending the batch, to compare the two
+                    static const bool spares = [] { const char *v = std::getenv("PS2_GPU_Z_SPARES"); return !v || std::atoi(v) != 0; }();
+                    const bool z_spares_texture = spares && b.zpsm == PSMZ24 && high_byte;
+                    if (frame) end_batch(kEndFrameFeedback);
+                    else if (b.zwrite && !z_spares_texture && used.overlaps(b.z_range.lo, b.z_range.hi)) {
+                        // PS2_TRACE_BATCH=N prints the first N of these: what the texture covers against the z buffer
+                        if (trace_batches()) {
+                            std::fprintf(stderr, "[batch] z-fb: tex tbp %u tbw %u tpsm %02x texels %d,%d-%d,%d bytes %llx-%llx | z zbp %u zpsm %02x fbw %u box %d,%d-%d,%d bytes %llx-%llx | frame fbp %u fpsm %02x | %zu prims\n",
+                                         setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3], static_cast<unsigned long long>(used.lo),
+                                         static_cast<unsigned long long>(used.hi), b.zbp, b.zpsm, b.fbw, b.minx, b.miny, b.maxx, b.maxy,
+                                         static_cast<unsigned long long>(b.z_range.lo), static_cast<unsigned long long>(b.z_range.hi), b.fbp, b.fpsm,
+                                         b.prims.size() / kPrimWords);
+                        }
+                        end_batch(kEndZFeedback);
+                    }
                 }
             }
         }
@@ -1422,7 +1478,7 @@ void draw(const State &st, const Vertex *v, int count) {
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
     b.maxy = std::max(b.maxy, maxy);
-    if (b.prims.size() >= kPrimWords * 65536) emit_all();
+    if (b.prims.size() >= kPrimWords * 65536) end_batch(kEndFull);
 }
 
 void image_begin(const State &s) {
@@ -1476,7 +1532,7 @@ void local_copy(const State &s) {
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     flush_image();
     if (g_clut_loads + 2 >= kClutSlots) {
-        emit_all();
+        end_batch(kEndClutSlots);
         submit();
     }
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
@@ -1770,6 +1826,10 @@ bool present(const DisplaySource &src) {
     wgpuTextureRelease(st.texture);
     return true;
 }
+
+std::uint64_t readbacks() { return g_readbacks; }
+std::uint64_t batch_ends(int reason) { return reason >= 0 && reason < kEndReasons ? g_batch_ends[reason] : 0; }
+double readback_ms() { return g_readback_ms; }
 
 double busy_ms() {
     if (!g_measured) return 0.0;

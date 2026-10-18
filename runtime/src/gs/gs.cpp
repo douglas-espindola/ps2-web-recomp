@@ -851,6 +851,24 @@ double gpu_busy_ms() {
 #endif
 }
 
+std::uint64_t gpu_batch_ends(int reason) {
+#ifdef PS2_GPU
+    return gpu::batch_ends(reason);
+#else
+    return 0;
+#endif
+}
+
+double gpu_readback_ms(std::uint64_t &count) {
+#ifdef PS2_GPU
+    count = gpu::readbacks();
+    return gpu::readback_ms();
+#else
+    count = 0;
+    return 0.0;
+#endif
+}
+
 DisplayRegs display_regs() { return DisplayRegs{g_pmode, g_smode2, {g_dispfb[0], g_dispfb[1]}, {g_display[0], g_display[1]}}; }
 
 bool present() { return present(display_regs()); }
