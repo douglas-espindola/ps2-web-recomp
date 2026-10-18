@@ -1,6 +1,7 @@
 #include "queue.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -100,7 +101,12 @@ void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *d
             break;
         }
         producer_waiting_.store(1);
-        if (head + pad + need - tail_.load() > capacity_) wait(freed_, seen);
+        if (head + pad + need - tail_.load() > capacity_) {
+            const auto start = std::chrono::steady_clock::now();
+            wait(freed_, seen);
+            blocked_ms_.store(blocked_ms_.load(std::memory_order_relaxed) + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                              std::memory_order_relaxed);
+        }
     }
     std::uint8_t *at = buffer_.get() + head % capacity_;
     const Header h{type, bytes, arg0, arg1};

@@ -24,7 +24,7 @@ int usage() {
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
-                 "              [--save-state frame:file] [--load-state file]\n");
+                 "              [--save-state frame:file] [--load-state file] [--record-input file] [--replay-input file] [--hash-log file]\n");
     return 2;
 }
 
@@ -70,6 +70,9 @@ int main(int argc, char **argv) {
             ps2::g_options.save_state_path = spec.substr(colon + 1);
         }
         else if (a == "--load-state" && i + 1 < argc) load_path = argv[++i];
+        else if (a == "--record-input" && i + 1 < argc) ps2::g_options.input_record_path = argv[++i];
+        else if (a == "--replay-input" && i + 1 < argc) ps2::g_options.input_replay_path = argv[++i];
+        else if (a == "--hash-log" && i + 1 < argc) ps2::g_options.hash_log_path = argv[++i];
         else return usage();
     }
 

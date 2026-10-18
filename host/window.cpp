@@ -365,7 +365,7 @@ int run_window(const std::function<int()> &emulate) {
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
         poll();
-        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, [] { show_speed(); return true; }, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
     }
     emulation.join();
     SDL_Quit();
