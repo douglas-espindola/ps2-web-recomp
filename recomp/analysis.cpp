@@ -197,7 +197,8 @@ std::vector<std::uint32_t> frame_starts(const Image &image, std::uint32_t begin,
 
 }
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic) {
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic,
+                std::pair<std::uint32_t, std::uint32_t> scan) {
     Program p;
     p.dynamic = dynamic;
     p.base = UINT32_MAX;
@@ -225,6 +226,10 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
     if (image.text().second > image.text().first) {
         text_begin = std::min(text_begin, image.text().first);
         text_end = std::max(text_end, image.text().second);
+    }
+    if (scan.second > scan.first) {
+        text_begin = scan.first;
+        text_end = scan.second;
     }
 
     for (int round = 0; round < 8; ++round) {
