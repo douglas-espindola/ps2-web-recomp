@@ -40,6 +40,8 @@ Image Image::load(const std::string &path) {
         const auto filesz = read<std::uint32_t>(data, ph + 16), memsz = read<std::uint32_t>(data, ph + 20);
         const auto flags = read<std::uint32_t>(data, ph + 24);
         if (offset + filesz > data.size()) throw std::runtime_error("segment outside the file");
+        // A segment with no file data only reserves memory, often for overlays loaded at run time: its zeros are not code.
+        if (!filesz) continue;
         Segment segment{vaddr, std::vector<std::uint8_t>(memsz), (flags & 1u) != 0};
         std::memcpy(segment.bytes.data(), data.data() + offset, filesz);
         image.segments_.push_back(std::move(segment));

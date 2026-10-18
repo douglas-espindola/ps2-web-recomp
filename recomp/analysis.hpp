@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace recomp {
@@ -23,6 +24,9 @@ struct Program {
     }
 };
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {});
+// scan, when set, bounds exactly where words and frames are tried as code; otherwise that is the text section widened
+// to the code the walk from the entries found.
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {},
+                std::pair<std::uint32_t, std::uint32_t> scan = {});
 
 }

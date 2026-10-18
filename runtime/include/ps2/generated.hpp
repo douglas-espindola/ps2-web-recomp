@@ -30,8 +30,21 @@ struct ModuleInfo {
     std::uint32_t count;
 };
 
+// Code a game loads at a fixed address, where several overlays take turns in the same window. The one resident is
+// the one whose checks, pairs of absolute address and expected word, all match memory; its units have absolute bases.
+struct OverlayInfo {
+    const char *name;
+    std::uint32_t base;
+    std::uint32_t size;
+    const std::uint32_t *checks;
+    std::uint32_t check_count;
+    const UnitInfo *units;
+    std::uint32_t count;
+};
+
 void register_units(const UnitInfo *units, std::uint32_t count);
 void register_modules(const ModuleInfo *modules, std::uint32_t count);
+void register_overlays(const OverlayInfo *overlays, std::uint32_t count);
 
 void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);

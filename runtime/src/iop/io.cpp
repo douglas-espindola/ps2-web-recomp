@@ -74,7 +74,11 @@ int open(const std::string &path, std::uint32_t flags) {
     return fd;
 }
 
-int close(int fd) { return g_files.erase(fd) ? 0 : kBadFd; }
+int close(int fd) {
+    const int result = g_files.erase(fd) ? 0 : kBadFd;
+    if (kernel::g_trace_hle) std::fprintf(stderr, "[io] close %d -> %d\n", fd, result);
+    return result;
+}
 
 int read(int fd, std::uint8_t *out, std::uint32_t size) {
     auto it = g_files.find(fd);
@@ -143,7 +147,13 @@ void install_io() {
     io::reset();
     register_hle_library("ioman", 0x0104);
     def("ioman", 4, "open", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::open(ram_string(arg(c, 0)), arg(c, 1))); });
-    def("ioman", 5, "close", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::close(static_cast<int>(arg(c, 0)))); });
+    // SCE's ioman answers a successful close with the descriptor, not 0, and drivers check for it: the sound driver
+    // of Naruto Shippuden: Ultimate Ninja 5 retries forever unless close(fd) == fd.
+    def("ioman", 5, "close", [](Cpu &c) {
+        const int fd = static_cast<int>(arg(c, 0));
+        const int result = io::close(fd);
+        c.r[2] = static_cast<std::uint32_t>(result < 0 ? result : fd);
+    });
     def("ioman", 6, "read", [](Cpu &c) {
         std::vector<std::uint8_t> buffer(arg(c, 2));
         const int n = io::read(static_cast<int>(arg(c, 0)), buffer.data(), arg(c, 2));
