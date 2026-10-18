@@ -249,7 +249,29 @@ void log_hashes() {
     const std::uint64_t ee = hash_memory(g_ram, kRamSize) ^ (hash_memory(g_spr, kScratchpadSize) * 0x100000001B3ull);
     std::fprintf(g_hash_log, "%llu %016llx %016llx\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(ee),
                  static_cast<unsigned long long>(hash_memory(iop::g_ram, iop::kRamSize)));
+    if (g_frames >= g_options.hash_blocks_from && g_frames <= g_options.hash_blocks_to) {
+        constexpr std::size_t kBlock = 64u << 10;
+        std::fprintf(g_hash_log, "B %llu", static_cast<unsigned long long>(g_frames));
+        for (std::size_t at = 0; at < kRamSize; at += kBlock) std::fprintf(g_hash_log, " %016llx", static_cast<unsigned long long>(hash_memory(g_ram + at, kBlock)));
+        std::fprintf(g_hash_log, " %016llx", static_cast<unsigned long long>(hash_memory(g_spr, kScratchpadSize)));
+        for (std::size_t at = 0; at < iop::kRamSize; at += kBlock) std::fprintf(g_hash_log, " %016llx", static_cast<unsigned long long>(hash_memory(iop::g_ram + at, kBlock)));
+        std::fprintf(g_hash_log, "\n");
+    }
     if (g_frames % 50 == 0) std::fflush(g_hash_log);
+}
+
+void dump_ram() {
+    if (g_options.dump_ram_path.empty() || g_frames != g_options.dump_ram_frame) return;
+    std::FILE *f = std::fopen(g_options.dump_ram_path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "[hash] cannot write %s\n", g_options.dump_ram_path.c_str());
+        return;
+    }
+    std::fwrite(g_ram, 1, kRamSize, f);
+    std::fwrite(g_spr, 1, kScratchpadSize, f);
+    std::fwrite(iop::g_ram, 1, iop::kRamSize, f);
+    std::fclose(f);
+    std::fprintf(stderr, "[hash] memory of frame %llu written to %s\n", static_cast<unsigned long long>(g_frames), g_options.dump_ram_path.c_str());
 }
 
 void time_frames() {
@@ -289,6 +311,7 @@ void vblank() {
     replay_inputs();
     record_inputs();
     log_hashes();
+    dump_ram();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
@@ -723,6 +746,11 @@ bool parse_axis(const std::string &spec, AxisPress &press) {
 }
 
 double gpu_busy_ms() { return gs::gpu_busy_ms(); }
+
+std::time_t guest_clock() {
+    if (g_options.rtc_epoch < 0) return std::time(nullptr);
+    return static_cast<std::time_t>(g_options.rtc_epoch + static_cast<std::int64_t>(now() / kEeClock));
+}
 
 #ifdef __EMSCRIPTEN__
 EM_ASYNC_JS(void, ps2_browser_yield, (), {

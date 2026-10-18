@@ -3,6 +3,7 @@
 #include "ps2/disc.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -76,10 +77,10 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
 void install_cdvd() {
     g_cd = CdState{};
     register_job(kJobCdRead, [](const Job &j) {
-        if (!disc::ready(j.a, j.b)) {
-            schedule(now() + usec_to_cycles(1000), j);
-            return;
-        }
+        // The read completes at the emulated time start_read gave it, whatever the host's disc is doing: disc::read
+        // waits for data that has not arrived. Postponing the job instead let the game see the host's latency (an
+        // HTTP fetch on the web), so two runs with the same inputs drifted apart. start_read already asked for the
+        // sectors, so the wait is rare.
         std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
         disc::read(j.a, j.b, data.data());
         for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
@@ -122,7 +123,7 @@ void install_cdvd() {
         c.r[2] = 1;
     });
     def("cdvdman", 24, "sceCdReadClock", [](Cpu &c) {
-        const std::time_t t = std::time(nullptr);
+        const std::time_t t = ps2::guest_clock();
         const std::tm *tm = std::gmtime(&t);
         const std::uint32_t p = arg(c, 0);
         write8(p + 0, 0);

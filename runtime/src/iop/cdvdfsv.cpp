@@ -5,6 +5,7 @@
 #include "ps2/memory.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <cstdio>
 #include <ctime>
@@ -39,19 +40,13 @@ void install_cdvdfsv() {
     g_stream_pos = 0;
     register_job(kJobFsvRead, [](const Job &j) {
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] stream write lsn %u count %u to 0x%08X\n", j.a, j.b, j.c);
-        if (!disc::ready(j.a, j.b)) {
-            schedule(now() + usec_to_cycles(1000), j);
-            return;
-        }
+        // As in cdvdman's read: the job completes at the emulated time it was given, and disc::read waits for sectors
+        // the host has not fetched yet. Postponing it let streams (the game's music) advance by the host's latency.
         read_to_ee(j.a, j.b, j.c);
         sif::complete_call(0x80000595u);
     });
     register_job(kJobFsvComplete, [](const Job &) { sif::complete_call(0x80000595u); });
     register_job(kJobFsvIopRead, [](const Job &j) {
-        if (!disc::ready(j.a, j.b)) {
-            schedule(now() + usec_to_cycles(1000), j);
-            return;
-        }
         std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
         disc::read(j.a, j.b, data.data());
         for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
@@ -64,7 +59,7 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000593u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         switch (method) {
         case 0x01: {
-            const std::time_t t = std::time(nullptr);
+            const std::time_t t = ps2::guest_clock();
             const std::tm *tm = std::gmtime(&t);
             set_ee32(ret, 1);
             std::uint8_t *clock = ps2::g_ram + ret + 4;

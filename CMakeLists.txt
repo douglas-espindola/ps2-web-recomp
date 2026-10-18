@@ -58,6 +58,10 @@ add_library(ps2runtime STATIC
     runtime/src/iop/cdvdfsv.cpp)
 target_include_directories(ps2runtime PUBLIC runtime/include)
 target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
+# The PS2's FPU and vector units round every multiply and every add. A compiler that fuses a*b+c into one
+# instruction (clang does on arm64) rounds once, so native results drifted from the browser's, where WebAssembly
+# has no fused multiply-add. PUBLIC so the translated game code gets it too.
+target_compile_options(ps2runtime PUBLIC -ffp-contract=off)
 
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
 if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")

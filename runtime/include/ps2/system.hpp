@@ -3,6 +3,7 @@
 #include "cpu.hpp"
 
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <vector>
@@ -66,6 +67,16 @@ struct Options {
     // a hash of the EE memory (RAM and scratchpad) and of the IOP RAM at every vblank, after the inputs are applied;
     // two runs with the same inputs must write the same file
     std::string hash_log_path;
+    // within these frames the hash log also gets a "B frame ..." line with one hash per 64 KB block: 512 for the EE
+    // RAM, 1 for the scratchpad and 32 for the IOP RAM, to tell where two runs first differ
+    std::uint64_t hash_blocks_from = 0, hash_blocks_to = 0;
+    // seconds since 1970 that the console's clock shows at boot; it then advances with the emulated time, so two
+    // runs read the same clock. Negative leaves the host's clock.
+    std::int64_t rtc_epoch = -1;
+    // at that vblank, right after the hash, the EE RAM, the scratchpad and the IOP RAM go raw into dump_ram_path,
+    // to find the addresses where two runs differ
+    std::string dump_ram_path;
+    std::uint64_t dump_ram_frame = 0;
 };
 
 extern Options g_options;
@@ -82,6 +93,8 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+// the time the console's clock shows, from Options::rtc_epoch or from the host
+std::time_t guest_clock();
 std::uint64_t hblank_cycles();
 void set_budget(Cpu &c, std::int64_t cycles);
 void schedule(int event, std::uint64_t at, std::function<void()> action);

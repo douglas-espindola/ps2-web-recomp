@@ -483,6 +483,21 @@ int main(int argc, char **argv) {
         else if (a == "--record-input" && i + 1 < argc) ps2::g_options.input_record_path = argv[++i];
         else if (a == "--replay-input" && i + 1 < argc) ps2::g_options.input_replay_path = argv[++i];
         else if (a == "--hash-log" && i + 1 < argc) ps2::g_options.hash_log_path = argv[++i];
+        else if (a == "--rtc" && i + 1 < argc) ps2::g_options.rtc_epoch = std::strtoll(argv[++i], nullptr, 10);
+        else if (a == "--hash-blocks" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const auto dash = spec.find('-');
+            ps2::g_options.hash_blocks_from = std::strtoull(spec.c_str(), nullptr, 10);
+            ps2::g_options.hash_blocks_to = dash == std::string::npos ? ps2::g_options.hash_blocks_from : std::strtoull(spec.c_str() + dash + 1, nullptr, 10);
+        }
+        else if (a == "--dump-ram" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const auto colon = spec.find(':');
+            if (colon != std::string::npos) {
+                ps2::g_options.dump_ram_frame = std::strtoull(spec.substr(0, colon).c_str(), nullptr, 10);
+                ps2::g_options.dump_ram_path = spec.substr(colon + 1);
+            }
+        }
     }
     if (launch.args.empty()) {
         std::string boot = "/game/core.elf";

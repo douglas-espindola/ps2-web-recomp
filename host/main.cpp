@@ -25,7 +25,7 @@ int usage() {
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file] [--widescreen] [--patches file]\n"
-                 "              [--record-input file] [--replay-input file] [--hash-log file]\n");
+                 "              [--record-input file] [--replay-input file] [--hash-log file] [--rtc epoch] [--dump-ram frame:file] [--hash-blocks from-to]\n");
     return 2;
 }
 
@@ -83,6 +83,21 @@ int main(int argc, char **argv) {
         else if (a == "--record-input" && i + 1 < argc) ps2::g_options.input_record_path = argv[++i];
         else if (a == "--replay-input" && i + 1 < argc) ps2::g_options.input_replay_path = argv[++i];
         else if (a == "--hash-log" && i + 1 < argc) ps2::g_options.hash_log_path = argv[++i];
+        else if (a == "--rtc" && i + 1 < argc) ps2::g_options.rtc_epoch = std::strtoll(argv[++i], nullptr, 10);
+        else if (a == "--hash-blocks" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const auto dash = spec.find('-');
+            ps2::g_options.hash_blocks_from = std::strtoull(spec.c_str(), nullptr, 10);
+            ps2::g_options.hash_blocks_to = dash == std::string::npos ? ps2::g_options.hash_blocks_from : std::strtoull(spec.c_str() + dash + 1, nullptr, 10);
+        }
+        else if (a == "--dump-ram" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const auto colon = spec.find(':');
+            if (colon != std::string::npos) {
+                ps2::g_options.dump_ram_frame = std::strtoull(spec.substr(0, colon).c_str(), nullptr, 10);
+                ps2::g_options.dump_ram_path = spec.substr(colon + 1);
+            }
+        }
         else return usage();
     }
 
