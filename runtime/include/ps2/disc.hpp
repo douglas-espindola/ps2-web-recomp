@@ -26,6 +26,10 @@ bool is_open();
 bool read(std::uint32_t sector, std::uint32_t count, void *out);
 bool ready(std::uint32_t sector, std::uint32_t count);
 std::optional<Entry> find(const std::string &path);
+// a whole file of the disc, through the same reader as every other access
+bool read_file(const std::string &path, std::vector<std::uint8_t> &out);
+// the boot program SYSTEM.CNF names in BOOT2, as the BIOS sees it (cdrom0:\NAME;1)
+std::optional<std::string> boot_path();
 std::uint32_t layer1_start();
 std::uint64_t sector_count();
 

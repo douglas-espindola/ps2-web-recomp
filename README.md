@@ -91,7 +91,7 @@ The page puts a memory card in slot 1 and keeps it in the browser's storage for 
 
 ## Hosting
 
-The page uses SharedArrayBuffer for its threads, so it has to be served cross-origin isolated, with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`. `scripts/serve.py` sends both headers and supports the Range requests the disc streaming relies on. Anyone who can reach the server can load the game, so keep it to yourself.
+The page uses SharedArrayBuffer for its threads, so it has to be served cross-origin isolated, with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`. `scripts/serve.py` sends both headers and supports the Range requests the disc streaming relies on. A page can also read the disc from a file the player picks: when the shell puts a `File` in `Module.discFile` (and its size in `Module.discSize`) before the run starts, blocks are read with `Blob.slice` instead of over HTTP. Built with an empty `PS2_WEB_ELF`, the bundle carries no executable, and the page boots the program the disc's `SYSTEM.CNF` names in `BOOT2`, as the console does. Anyone who can reach the server can load the game, so keep it to yourself.
 
 ## Legal
 

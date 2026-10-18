@@ -503,17 +503,21 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return false;
     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
-    if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) return false;
-    const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, data.data() + o, 4); return v; };
-    const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; };
+    return load_elf(data.data(), data.size(), entry);
+}
+
+bool load_elf(const std::uint8_t *data, std::size_t size, std::uint32_t &entry) {
+    if (size < 52 || std::memcmp(data, "\x7f" "ELF", 4) != 0) return false;
+    const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, data + o, 4); return v; };
+    const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data + o, 2); return v; };
     entry = u32(24);
     const std::uint32_t phoff = u32(28);
     for (std::uint32_t i = 0; i < u16(44); ++i) {
         const std::size_t ph = phoff + i * u16(42);
         if (u32(ph) != 1) continue;
         const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
-        if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
-        std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
+        if (vaddr + memsz > kRamSize || offset + filesz > size) return false;
+        std::memcpy(g_ram + vaddr, data + offset, filesz);
         watch_span(vaddr, filesz, "boot:load_exec");
         std::memset(g_ram + vaddr + filesz, 0, memsz - filesz);
     }

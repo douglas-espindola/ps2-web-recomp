@@ -21,12 +21,27 @@ void register_generated_vu();
 
 EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
 
+// Reads a disc block for the page thread's loop. The disc is the File (or any Blob) the page put in Module.discFile,
+// read with Blob.slice, or else Module.discUrl over HTTP Range requests. Either way the slot is finished through
+// Atomics, so the emulation thread waits the same for both.
 EM_JS(void, ps2web_fetch, (const char *url, double offset, int size, void *out, std::atomic<std::uint32_t> *state), {
-    const target = UTF8ToString(url);
     const finish = (value) => {
         Atomics.store(HEAP32, state >> 2, value);
         Atomics.notify(HEAP32, state >> 2);
     };
+    if (Module.discFile) {
+        Module.discFile.slice(offset, offset + size).arrayBuffer()
+            .then((buffer) => {
+                HEAPU8.set(new Uint8Array(buffer, 0, Math.min(buffer.byteLength, size)), out);
+                finish(3);
+            })
+            .catch((e) => {
+                console.warn('disc read failed', e);
+                finish(4);
+            });
+        return;
+    }
+    const target = UTF8ToString(url);
     fetch(target, {headers: {Range: 'bytes=' + offset + '-' + (offset + size - 1)}})
         .then((response) => {
             if (response.status !== 206 && response.status !== 200) throw new Error('status ' + response.status);
@@ -445,16 +460,37 @@ struct Launch {
     std::vector<std::string> args;
 };
 
+// on the page thread, where the page's Module.onHalt lives; the emulation thread is a worker
+void report_halt(const std::string &reason) {
+    MAIN_THREAD_EM_ASM({
+        if (typeof Module.onHalt === 'function')
+            Module.onHalt(UTF8ToString($0));
+    }, reason.c_str());
+}
+
 void *emulate(void *data) {
     const Launch &launch = *static_cast<const Launch *>(data);
     if (g_disc_size && !ps2::disc::open("disc", g_disc_size, read_disc, disc_ready)) std::fprintf(stderr, "[web] cannot read the disc image\n");
     std::uint32_t entry = 0;
     ps2::load_patches("/game/patches.txt");
-    if (!ps2::load_elf("/game/core.elf", entry)) {
-        std::fprintf(stderr, "cannot load the game executable\n");
-        return nullptr;
+    std::vector<std::string> args = launch.args;
+    if (ps2::load_elf("/game/core.elf", entry)) {
+        if (args.empty()) args.push_back("/game/core.elf");
+    } else {
+        // no executable in the bundle: boot the program SYSTEM.CNF names, from the disc, as the BIOS does
+        const auto boot = ps2::disc::is_open() ? ps2::disc::boot_path() : std::nullopt;
+        std::vector<std::uint8_t> elf;
+        if (!boot || !ps2::disc::read_file(*boot, elf) || !ps2::load_elf(elf.data(), elf.size(), entry)) {
+            const std::string reason = "cannot load the game executable: none in the bundle, and " +
+                                       std::string(!ps2::disc::is_open() ? "no disc" : !boot ? "no BOOT2 in the disc's SYSTEM.CNF" : "cannot read " + *boot + " from the disc");
+            std::fprintf(stderr, "%s\n", reason.c_str());
+            report_halt(reason);
+            return nullptr;
+        }
+        std::fprintf(stderr, "[web] booting %s from the disc\n", boot->c_str());
+        if (args.empty()) args.push_back(*boot);
     }
-    ps2::boot(entry, launch.args);
+    ps2::boot(entry, args);
     if (g_state_url) {
         const double size = ps2web_url_size(g_state_url);
         std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
@@ -464,10 +500,7 @@ void *emulate(void *data) {
         }
     }
     ps2::run();
-    EM_ASM({
-        if (typeof Module.onHalt === 'function')
-            Module.onHalt(UTF8ToString($0));
-    }, ps2::halt_reason().c_str());
+    report_halt(ps2::halt_reason());
     return nullptr;
 }
 
@@ -583,17 +616,16 @@ int main(int argc, char **argv) {
             }
         }
     }
+    // without --arg or a boot.txt, the emulation thread names the program after where it loaded it from
     if (launch.args.empty()) {
-        std::string boot = "/game/core.elf";
         if (std::FILE *f = std::fopen("/game/boot.txt", "rb")) {
             char text[256] = {};
             const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
             std::fclose(f);
             std::string line(text, n);
             line.erase(line.find_last_not_of(" \r\n\t") + 1);
-            if (!line.empty()) boot = line;
+            if (!line.empty()) launch.args.push_back(line);
         }
-        launch.args.push_back(boot);
     }
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();

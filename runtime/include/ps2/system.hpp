@@ -110,6 +110,7 @@ void request_iop_sync();
 void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
+bool load_elf(const std::uint8_t *data, std::size_t size, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);

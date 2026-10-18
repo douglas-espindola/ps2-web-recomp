@@ -132,6 +132,38 @@ std::optional<Entry> find(const std::string &raw) {
     return it->second;
 }
 
+bool read_file(const std::string &path, std::vector<std::uint8_t> &out) {
+    const auto entry = find(path);
+    if (!entry || entry->directory) return false;
+    out.resize((static_cast<std::size_t>(entry->size) + kSector - 1) / kSector * kSector);
+    if (!read(entry->sector, static_cast<std::uint32_t>(out.size() / kSector), out.data())) return false;
+    out.resize(entry->size);
+    return true;
+}
+
+std::optional<std::string> boot_path() {
+    std::vector<std::uint8_t> data;
+    if (!read_file("SYSTEM.CNF", data)) return std::nullopt;
+    const std::string text(data.begin(), data.end());
+    const auto trim = [](std::string s) {
+        s.erase(0, s.find_first_not_of(" \t\r"));
+        s.erase(s.find_last_not_of(" \t\r") + 1);
+        return s;
+    };
+    std::size_t at = 0;
+    while (at < text.size()) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        const auto equals = line.find('=');
+        if (equals == std::string::npos || upper(trim(line.substr(0, equals))) != "BOOT2") continue;
+        const std::string value = trim(line.substr(equals + 1));
+        if (!value.empty()) return value;
+    }
+    return std::nullopt;
+}
+
 std::uint32_t layer1_start() { return g_layer1; }
 std::uint64_t sector_count() { return g_size / kSector; }
 
